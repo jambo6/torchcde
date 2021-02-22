@@ -42,7 +42,7 @@ def _check_compatability_per_tensor_prod(control_gradient, vector_field, z0):
 
 def _check_compatability(X, func, z0, t):
     if not hasattr(X, 'derivative'):
-        raise ValueError("X must have a 'derivative' method.")
+        raise ValueError("X must have a 'derivative' vector_field_type.")
     control_gradient = X.derivative(t[0].detach())
     if hasattr(func, 'prod'):
         is_prod = True
@@ -100,36 +100,45 @@ def _check_compatability(X, func, z0, t):
 
 
 class _VectorField(torch.nn.Module):
-    def __init__(self, X, func, is_tensor, is_prod):
+    def __init__(self, X, func, is_tensor, is_prod, method):
         super(_VectorField, self).__init__()
 
         self.X = X
         self.func = func
         self.is_tensor = is_tensor
         self.is_prod = is_prod
+        self.method = method
 
     def forward(self, t, z):
         # control_gradient is of shape (..., input_channels)
         control_gradient = self.X.derivative(t)
 
         if self.is_prod:
+            if self.method != 'matmul':
+                raise NotImplementedError("only matmul implemented for is_prod")
             # out is of shape (..., hidden_channels)
             out = self.func.prod(t, z, control_gradient)
         else:
-            # vector_field is of shape (..., hidden_channels, input_channels)
-            vector_field = self.func(t, z)
-            if self.is_tensor:
-                # out is of shape (..., hidden_channels)
-                # (The squeezing is necessary to make the matrix-multiply properly batch in all cases)
-                out = (vector_field @ control_gradient.unsqueeze(-1)).squeeze(-1)
+            # vector_field isof shape (..., hidden_channels, input_channels)
+            if self.method in ['evaluate', 'derivative']:
+                get_func_data = getattr(self.X, self.method)
+                func_inputs = torch.cat([z, get_func_data(t)], -1)
+                print(func_inputs)
+                out = self.func(t, func_inputs)
             else:
-                out = tuple((vector_field_ @ control_gradient_.unsqueeze(-1)).squeeze(-1)
-                            for vector_field_, control_gradient_ in zip(vector_field, control_gradient))
+                vector_field = self.func(t, z)
+                if self.is_tensor:
+                    # out is of shape (..., hidden_channels)
+                    # (The squeezing is necessary to make the matrix-multiply properly batch in all cases)
+                    out = (vector_field @ control_gradient.unsqueeze(-1)).squeeze(-1)
+                else:
+                    out = tuple((vector_field_ @ control_gradient_.unsqueeze(-1)).squeeze(-1)
+                                for vector_field_, control_gradient_ in zip(vector_field, control_gradient))
 
         return out
 
 
-def cdeint(X, func, z0, t, adjoint=True, **kwargs):
+def cdeint(X, func, z0, t, adjoint=True, vector_field_type='matmul', **kwargs):
     r"""Solves a system of controlled differential equations.
 
     Solves the controlled problem:
@@ -156,6 +165,10 @@ def cdeint(X, func, z0, t, adjoint=True, **kwargs):
         t: a one dimensional tensor describing the times to range of times to integrate over and output the results at.
             The initial time will be t[0] and the final time will be t[-1].
         adjoint: A boolean; whether to use the adjoint method to backpropagate. Defaults to True.
+        vector_field_type: A string from ('matmul', 'evaluate', 'derivative') that determines how the data interacts with the
+            vector field. 'matmul' is the classic approach, 'evaluate' and 'derivative' concatenate the hidden state
+            with the data and put everything into the vector field (like an rnn) with 'evaluate' inputting the raw data
+            and 'derivative' inputting the derivatives.
         **kwargs: Any additional kwargs to pass to the odeint solver of torchdiffeq (the most common are `rtol`, `atol`,
             `method`, `options`).
 
@@ -174,6 +187,8 @@ def cdeint(X, func, z0, t, adjoint=True, **kwargs):
         Note that the returned tensor puts the sequence dimension second-to-last, rather than first like in
         `torchdiffeq.odeint`.
     """
+    if vector_field_type not in ['matmul', 'evaluate', 'derivative']:
+        raise ValueError("vector_field_type string not recognised")
 
     # Reduce the default values for the tolerances because CDEs are difficult to solve with the default high tolerances.
     if 'atol' not in kwargs:
@@ -194,7 +209,7 @@ def cdeint(X, func, z0, t, adjoint=True, **kwargs):
             if buffer.requires_grad and id(buffer) not in _adjoint_params:
                 warnings.warn("One of the inputs to the control path X requires gradients but is not listed in "
                               "`options['adjoint_params']`. This is probably a mistake: it will not receive a gradient "
-                              "when using the adjoint method. Either have the input not require gradients (if that "
+                              "when using the adjoint vector_field_type. Either have the input not require gradients (if that "
                               "was unintended), or include it (and every other parameter needing gradients) in "
                               "`adjoint_params`. For example:\n"
                               "```\n"
@@ -205,7 +220,7 @@ def cdeint(X, func, z0, t, adjoint=True, **kwargs):
                               "cdeint(X=X, func=func, ..., adjoint_params=adjoint_params)\n"
                               "```")
 
-    vector_field = _VectorField(X=X, func=func, is_tensor=is_tensor, is_prod=is_prod)
+    vector_field = _VectorField(X=X, func=func, is_tensor=is_tensor, is_prod=is_prod, method=vector_field_type)
     odeint = torchdiffeq.odeint_adjoint if adjoint else torchdiffeq.odeint
     out = odeint(func=vector_field, y0=z0, t=t, **kwargs)
 
